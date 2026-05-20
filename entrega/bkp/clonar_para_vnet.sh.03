@@ -1,0 +1,741 @@
+#!/bin/bash
+
+# Cores para output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+NC='\033[0m' # No Color
+
+# Configurações globais
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATE_DIR="${SCRIPT_DIR}/.state"
+LOG_DIR="${SCRIPT_DIR}/logs/clientes"
+VNET_CONF_DIR="${SCRIPT_DIR}"
+
+# Função para imprimir mensagens coloridas
+print_msg() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[ERRO]${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[ATENÇÃO]${NC} $1"
+}
+
+print_info() {
+    echo -e "${BLUE}[DETALHE]${NC} $1"
+}
+
+print_header() {
+    echo -e "${CYAN}========================================${NC}"
+    echo -e "${CYAN}$1${NC}"
+    echo -e "${CYAN}========================================${NC}"
+}
+
+print_success() {
+    echo -e "${GREEN}✅ $1${NC}"
+}
+
+# Função para validar VM ID
+validate_vmid() {
+    local vmid=$1
+    if [[ $vmid =~ ^[0-9]+$ ]] && [ $vmid -ge 100 ] && [ $vmid -le 999999999 ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Função para validar nome da VM
+validate_vmname() {
+    local name=$1
+    if [[ $name =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Função para carregar configuração do cliente
+load_client_config() {
+    local client_name=$1
+    local config_file="${STATE_DIR}/client_${client_name}.conf"
+    
+    if [ -f "$config_file" ]; then
+        source "$config_file"
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Função para salvar configuração da VM criada
+save_vm_config() {
+    local client_name=$1
+    local service_type=$2
+    local db_type=$3
+    local vm_id=$4
+    local vm_name=$5
+    local vnet_name=$6
+    
+    local config_file="${LOG_DIR}/${client_name}/vm_${vm_id}_$(date +%Y%m%d_%H%M%S).conf"
+    mkdir -p "$(dirname "$config_file")"
+    
+    cat > "$config_file" << EOF
+# Configuração da VM - $(date)
+CLIENT_NAME="$client_name"
+SERVICE_TYPE="$service_type"
+DB_TYPE="$db_type"
+VM_ID="$vm_id"
+VM_NAME="$vm_name"
+VNET_NAME="$vnet_name"
+STATUS="CREATED"
+EOF
+    
+    print_msg "Configuração da VM salva em: $config_file"
+    
+    # Atualizar arquivo de estado do cliente
+    local state_file="${LOG_DIR}/${client_name}/state.conf"
+    echo "VM_${vm_id}_NAME=\"$vm_name\"" >> "$state_file"
+    echo "VM_${vm_id}_TYPE=\"$service_type\"" >> "$state_file"
+    echo "VM_${vm_id}_VNET=\"$vnet_name\"" >> "$state_file"
+}
+
+# Função para listar VNets disponíveis
+list_vnets() {
+    local ssh_cmd=$1
+    echo ""
+    $ssh_cmd "pvesh get /cluster/sdn/vnets --output-format json" 2>/dev/null | grep -oP '"vnet":"\K[^"]+' | while read vnet; do
+        echo "  - $vnet"
+    done
+}
+
+# Função para obter próximo VMID disponível (para DBaaS - faixa geral)
+get_next_vmid() {
+    local ssh_cmd=$1
+    local MIN_VMID=100
+    local all_vmids=$($ssh_cmd "qm list" 2>/dev/null | tail -n +2 | awk '{print $1}' | sort -n)
+    
+    if [ -z "$all_vmids" ]; then
+        echo $MIN_VMID
+        return 0
+    fi
+    
+    local max_vmid=$(echo "$all_vmids" | tail -1)
+    local suggested=$((max_vmid + 1))
+    
+    # Verificar gaps
+    local prev=$((MIN_VMID - 1))
+    for vmid in $all_vmids; do
+        if [ $vmid -ge $MIN_VMID ]; then
+            if [ $((vmid - prev)) -gt 1 ]; then
+                suggested=$((prev + 1))
+                break
+            fi
+            prev=$vmid
+        fi
+    done
+    
+    if [ $suggested -lt $MIN_VMID ]; then
+        suggested=$MIN_VMID
+    fi
+    
+    echo $suggested
+}
+
+# Função para obter próximo VMID disponível na faixa 2000-2999 (para KaaS)
+get_next_vmid_kaas() {
+    local ssh_cmd=$1
+    local MIN_VMID=2000
+    local MAX_VMID=2999
+    
+    # Obter todas as VMs existentes
+    local existing_vmids=$($ssh_cmd "qm list" 2>/dev/null | tail -n +2 | awk '{print $1}' | sort -n)
+    
+    # Criar array associativo para lookup rápido
+    local -A used_vmids
+    for vmid in $existing_vmids; do
+        used_vmids[$vmid]=1
+    done
+    
+    # Procurar primeiro ID livre na faixa
+    for vmid in $(seq $MIN_VMID $MAX_VMID); do
+        if [ -z "${used_vmids[$vmid]}" ]; then
+            echo $vmid
+            return 0
+        fi
+    done
+    
+    print_error "Faixa de VMIDs $MIN_VMID-$MAX_VMID está completamente ocupada!"
+    return 1
+}
+
+# Função para verificar disponibilidade da faixa de IDs para KaaS
+check_kaas_range_availability() {
+    local ssh_cmd=$1
+    local needed_vms=$2
+    local MIN_VMID=2000
+    local MAX_VMID=2999
+    
+    local existing_vmids=$($ssh_cmd "qm list" 2>/dev/null | tail -n +2 | awk '{print $1}' | sort -n)
+    local available_count=0
+    
+    for vmid in $(seq $MIN_VMID $MAX_VMID); do
+        if ! echo "$existing_vmids" | grep -q "^${vmid}$"; then
+            ((available_count++))
+        fi
+    done
+    
+    if [ $available_count -lt $needed_vms ]; then
+        print_error "Espaço insuficiente na faixa $MIN_VMID-$MAX_VMID"
+        print_error "Necessário: $needed_vms VMs | Disponível: $available_count"
+        return 1
+    fi
+    
+    print_success "Faixa $MIN_VMID-$MAX_VMID tem $available_count IDs disponíveis"
+    return 0
+}
+
+# Função para criar VM baseada no template (FULL CLONE)
+create_vm_from_template() {
+    local ssh_cmd=$1
+    local template_id=$2
+    local new_vmid=$3
+    local vm_name=$4
+    local storage=$5
+    local vnet_name=$6
+    local cpu=$7
+    local memory=$8
+    local disk_size=${9}
+    
+    # CORREÇÃO: Clone FULL (não linked clone)
+    print_msg "Clonando template $template_id para VM ID $new_vmid (FULL CLONE)..."
+    
+    # Usar --full 1 para clone completo
+    $ssh_cmd "qm clone $template_id $new_vmid --name $vm_name --storage $storage --full 1"
+    
+    if [ $? -ne 0 ]; then
+        print_error "Falha ao clonar VM"
+        return 1
+    fi
+    
+    print_success "VM clonada com sucesso!"
+    
+    # Configurar recursos (CPU e Memória)
+    print_msg "Configurando recursos da VM (CPU: $cpu, Memória: ${memory}MB)..."
+    $ssh_cmd "qm set $new_vmid --cores $cpu --memory $memory"
+    
+    # Redimensionar disco se necessário
+    if [ -n "$disk_size" ] && [ "$disk_size" != "auto" ]; then
+        print_msg "Redimensionando disco para ${disk_size}GB..."
+        # Primeiro, identificar o disco da VM
+        local disk_id=$($ssh_cmd "qm config $new_vmid" 2>/dev/null | grep -oP '^[a-z]+[0-9]+:.*' | head -1 | cut -d':' -f1)
+        if [ -n "$disk_id" ]; then
+            $ssh_cmd "qm disk resize $new_vmid $disk_id ${disk_size}G" 2>/dev/null
+            print_success "Disco redimensionado para ${disk_size}GB"
+        else
+            print_warning "Não foi possível identificar o disco para redimensionamento"
+        fi
+    fi
+    
+    # Configurar rede para usar a VNet
+    print_msg "Configurando interface de rede para VNet $vnet_name..."
+    $ssh_cmd "qm set $new_vmid --delete net0" > /dev/null 2>&1
+    $ssh_cmd "qm set $new_vmid --net0 virtio,bridge=$vnet_name,firewall=1"
+    
+    if [ $? -ne 0 ]; then
+        print_error "Falha ao configurar interface de rede"
+        return 1
+    fi
+    
+    print_success "Interface de rede configurada: bridge=$vnet_name"
+    return 0
+}
+
+# Função para configurar HAProxy
+configure_haproxy() {
+    local ssh_cmd=$1
+    local vm_id=$2
+    local client_name=$3
+    local vnet_name=$4
+    local cluster_ips=$5
+    
+    print_msg "Configurando HAProxy para o cliente $client_name..."
+    
+    # Comando para configurar HAProxy dentro da VM (via qm guest exec)
+    local haproxy_config="
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    maxconn 4096
+    user haproxy
+    group haproxy
+
+defaults
+    log global
+    mode tcp
+    option tcplog
+    retries 3
+    timeout connect 5s
+    timeout client 50s
+    timeout server 50s
+
+frontend kubernetes-frontend
+    bind *:6443
+    mode tcp
+    default_backend kubernetes-backend
+
+backend kubernetes-backend
+    mode tcp
+    balance roundrobin
+    option tcp-check
+$(echo "$cluster_ips" | sed 's/^/    server /' | sed 's/$/:6443 check fall 3 rise 2/')
+"
+    
+    # Salvar configuração localmente
+    local config_file="${LOG_DIR}/${client_name}/haproxy.cfg"
+    echo "$haproxy_config" > "$config_file"
+    print_msg "Configuração HAProxy salva em: $config_file"
+    print_info "Para aplicar a configuração, execute dentro da VM HAProxy:"
+    echo "  sudo cp $config_file /etc/haproxy/haproxy.cfg"
+    echo "  sudo systemctl restart haproxy"
+}
+
+# Menu principal
+print_header "CLONADOR DE VM PARA VNET - PROXMOX"
+
+# Verificar se sshpass está instalado
+if ! command -v sshpass &> /dev/null; then
+    print_warning "sshpass não está instalado."
+    read -p "Deseja instalar sshpass? (s/n): " INSTALL_SSHPASS
+    if [[ "$INSTALL_SSHPASS" =~ ^[Ss]$ ]]; then
+        sudo apt-get update && sudo apt-get install -y sshpass
+        if [ $? -eq 0 ]; then
+            print_msg "sshpass instalado com sucesso!"
+        else
+            print_error "Falha ao instalar sshpass"
+            exit 1
+        fi
+    else
+        print_error "sshpass é necessário para autenticação por senha."
+        exit 1
+    fi
+fi
+
+# Coletar informações do servidor Proxmox
+echo ""
+read -p "Digite o IP do servidor Proxmox (ex: 192.168.2.200): " PROXMOX_IP
+
+while [[ ! $PROXMOX_IP =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; do
+    print_error "IP inválido!"
+    read -p "Digite o IP do servidor Proxmox: " PROXMOX_IP
+done
+
+read -p "Digite o usuário SSH (padrão: root): " SSH_USER
+SSH_USER=${SSH_USER:-root}
+
+read -sp "Digite a senha SSH: " SSH_PASS
+echo ""
+
+SSH_CMD="sshpass -p '$SSH_PASS' ssh -o StrictHostKeyChecking=no $SSH_USER@$PROXMOX_IP"
+
+# Testar conexão SSH
+print_msg "Testando conexão SSH..."
+if ! $SSH_CMD "echo 'Conexão OK'" > /dev/null 2>&1; then
+    print_error "Não foi possível conectar ao servidor Proxmox."
+    exit 1
+fi
+print_success "Conexão SSH estabelecida!"
+
+# Listar clientes existentes
+print_header "CLIENTES EXISTENTES"
+CLIENTS_LIST=()
+if [ -d "$LOG_DIR" ]; then
+    for client_dir in "$LOG_DIR"/*/; do
+        if [ -d "$client_dir" ]; then
+            client_name=$(basename "$client_dir")
+            CLIENTS_LIST+=("$client_name")
+            echo "  - $client_name"
+        fi
+    done
+fi
+
+if [ ${#CLIENTS_LIST[@]} -eq 0 ]; then
+    print_warning "Nenhum cliente encontrado. Será necessário criar um novo."
+fi
+
+echo ""
+read -p "Digite o nome do cliente: " CLIENT_NAME
+
+if [ -z "$CLIENT_NAME" ]; then
+    print_error "Nome do cliente não pode ser vazio!"
+    exit 1
+fi
+
+# Carregar configuração do cliente
+CLIENT_POOL="Pool_$CLIENT_NAME"
+CLIENT_USER="$CLIENT_NAME@pve"
+
+# Verificar se a pool do cliente existe
+if ! $SSH_CMD "pvesh get /pools --output-format json" 2>/dev/null | grep -q "\"poolid\":\"$CLIENT_POOL\""; then
+    print_error "Pool '$CLIENT_POOL' não encontrada!"
+    print_info "Execute o script criar_usuario.sh primeiro para criar o cliente."
+    exit 1
+fi
+print_msg "Pool do cliente encontrada: $CLIENT_POOL"
+
+# Listar VNets disponíveis
+print_header "VNETS DISPONÍVEIS"
+list_vnets "$SSH_CMD"
+
+echo ""
+read -p "Digite o nome da VNet para este cliente: " VNET_NAME
+
+if [ -z "$VNET_NAME" ]; then
+    print_error "Nome da VNet não pode ser vazio!"
+    exit 1
+fi
+
+# Verificar se a VNet existe
+if ! $SSH_CMD "pvesh get /cluster/sdn/vnets/$VNET_NAME" > /dev/null 2>&1; then
+    print_error "VNet '$VNET_NAME' não encontrada!"
+    print_info "Execute o script criar_vnet.sh primeiro para criar a VNet."
+    exit 1
+fi
+print_success "VNet encontrada: $VNET_NAME"
+
+# Menu de seleção de serviço
+print_header "SELECIONE O TIPO DE SERVIÇO"
+echo "1 - DBaaS (Banco de Dados como Serviço)"
+echo "2 - KaaS (Kubernetes como Serviço)"
+echo "3 - Sair"
+echo ""
+read -p "Escolha uma opção (1-3): " SERVICE_OPTION
+
+case $SERVICE_OPTION in
+    1)
+        # DBaaS
+        print_header "DBaaS - BANCO DE DADOS"
+        echo "1 - MariaDB (Template ID: 110)"
+        echo "2 - PostgreSQL (Template ID: 111)"
+        echo ""
+        read -p "Escolha o tipo de banco de dados (1-2): " DB_OPTION
+        
+        case $DB_OPTION in
+            1)
+                TEMPLATE_ID=110
+                DB_TYPE="mariadb"
+                print_info "Template selecionado: MariaDB"
+                ;;
+            2)
+                TEMPLATE_ID=111
+                DB_TYPE="postgresql"
+                print_info "Template selecionado: PostgreSQL"
+                ;;
+            *)
+                print_error "Opção inválida!"
+                exit 1
+                ;;
+        esac
+        
+        # Configurações da VM
+        echo ""
+        print_header "CONFIGURAÇÕES DA VM"
+        
+        VM_ID=$(get_next_vmid "$SSH_CMD")
+        read -p "Digite o ID para a nova VM (padrão: $VM_ID): " CUSTOM_VMID
+        VM_ID=${CUSTOM_VMID:-$VM_ID}
+        
+        read -p "Digite o nome da VM (padrão: ${CLIENT_NAME}-${DB_TYPE}): " VM_NAME
+        VM_NAME=${VM_NAME:-"${CLIENT_NAME}-${DB_TYPE}"}
+        
+        read -p "Quantidade de CPUs (padrão: 2): " CPU_CORES
+        CPU_CORES=${CPU_CORES:-2}
+        
+        read -p "Memória RAM em MB (padrão: 4096): " MEMORY_MB
+        MEMORY_MB=${MEMORY_MB:-4096}
+        
+        read -p "Tamanho do disco em GB (padrão: auto - manter tamanho do template): " DISK_SIZE
+        DISK_SIZE=${DISK_SIZE:-auto}
+        
+        # Storage
+        STORAGE=$($SSH_CMD "pvesh get /nodes/localhost/storage --output-format json" 2>/dev/null | grep -oP '"storage":"\K[^"]+' | head -1)
+        STORAGE=${STORAGE:-"local-lvm"}
+        read -p "Storage para a VM (padrão: $STORAGE): " CUSTOM_STORAGE
+        STORAGE=${CUSTOM_STORAGE:-$STORAGE}
+        
+        # Resumo
+        print_header "RESUMO DA OPERAÇÃO"
+        echo "Cliente: $CLIENT_NAME"
+        echo "Pool: $CLIENT_POOL"
+        echo "Serviço: DBaaS - ${DB_TYPE^^}"
+        echo "Template ID: $TEMPLATE_ID"
+        echo "Nova VM ID: $VM_ID"
+        echo "Nome da VM: $VM_NAME"
+        echo "VNet: $VNET_NAME"
+        echo "CPUs: $CPU_CORES"
+        echo "Memória: ${MEMORY_MB}MB"
+        echo "Disco: ${DISK_SIZE}GB"
+        echo "Storage: $STORAGE"
+        echo ""
+        
+        read -p "Confirmar criação? (s/n): " CONFIRM
+        if [[ ! "$CONFIRM" =~ ^[Ss]$ ]]; then
+            print_warning "Operação cancelada."
+            exit 0
+        fi
+        
+        # Criar a VM (FULL CLONE)
+        create_vm_from_template "$SSH_CMD" "$TEMPLATE_ID" "$VM_ID" "$VM_NAME" "$STORAGE" "$VNET_NAME" "$CPU_CORES" "$MEMORY_MB" "$DISK_SIZE"
+        
+        if [ $? -eq 0 ]; then
+            # Adicionar VM à pool do cliente
+            print_msg "Adicionando VM à pool $CLIENT_POOL..."
+            $SSH_CMD "pvesh set /pools/$CLIENT_POOL --vms $VM_ID"
+            
+            # Salvar configuração
+            save_vm_config "$CLIENT_NAME" "DBaaS" "$DB_TYPE" "$VM_ID" "$VM_NAME" "$VNET_NAME"
+            
+            # Iniciar VM
+            read -p "Deseja iniciar a VM agora? (s/n - padrão: s): " START_VM
+            START_VM=${START_VM:-s}
+            
+            if [[ "$START_VM" =~ ^[Ss]$ ]]; then
+                print_msg "Iniciando VM $VM_ID..."
+                $SSH_CMD "qm start $VM_ID"
+                print_success "VM iniciada!"
+            fi
+            
+            print_header "VM CRIADA COM SUCESSO!"
+            echo "ID: $VM_ID"
+            echo "Nome: $VM_NAME"
+            echo "Tipo: ${DB_TYPE^^}"
+            echo "Pool: $CLIENT_POOL"
+            echo "VNet: $VNET_NAME"
+        else
+            print_error "Falha na criação da VM!"
+            exit 1
+        fi
+        ;;
+    
+    2)
+        # KaaS
+        print_header "KaaS - KUBERNETES CLUSTER"
+        print_info "As VMs serão criadas na faixa de IDs 2000-2999"
+        echo ""
+        print_info "Será criado um cluster Kubernetes com:"
+        echo "  1. HAProxy (Load Balancer)"
+        echo "  2. N Control Planes"
+        echo "  3. N Workers"
+        echo ""
+        
+        # Coletar informações do cluster
+        read -p "Quantidade de Control Planes (padrão: 1): " CP_COUNT
+        CP_COUNT=${CP_COUNT:-1}
+        
+        read -p "Quantidade de Workers (padrão: 2): " WORKER_COUNT
+        WORKER_COUNT=${WORKER_COUNT:-2}
+        
+        # Configurações de hardware
+        echo ""
+        print_header "CONFIGURAÇÕES DE HARDWARE"
+        
+        read -p "CPUs por Control Plane (padrão: 2): " CP_CPU
+        CP_CPU=${CP_CPU:-2}
+        
+        read -p "Memória por Control Plane em MB (padrão: 4096): " CP_MEM
+        CP_MEM=${CP_MEM:-4096}
+        
+        read -p "Disco por Control Plane em GB (padrão: auto): " CP_DISK
+        CP_DISK=${CP_DISK:-auto}
+        
+        read -p "CPUs por Worker (padrão: 4): " WORKER_CPU
+        WORKER_CPU=${WORKER_CPU:-4}
+        
+        read -p "Memória por Worker em MB (padrão: 8192): " WORKER_MEM
+        WORKER_MEM=${WORKER_MEM:-8192}
+        
+        read -p "Disco por Worker em GB (padrão: auto): " WORKER_DISK
+        WORKER_DISK=${WORKER_DISK:-auto}
+        
+        # Storage
+        STORAGE=$($SSH_CMD "pvesh get /nodes/localhost/storage --output-format json" 2>/dev/null | grep -oP '"storage":"\K[^"]+' | head -1)
+        STORAGE=${STORAGE:-"local-lvm"}
+        read -p "Storage para as VMs (padrão: $STORAGE): " CUSTOM_STORAGE
+        STORAGE=${CUSTOM_STORAGE:-$STORAGE}
+        
+        # Calcular total de VMs necessárias
+        TOTAL_VMS=$((1 + $CP_COUNT + $WORKER_COUNT))  # HAProxy + Control Planes + Workers
+        
+        # Verificar disponibilidade da faixa de IDs
+        print_header "VERIFICANDO DISPONIBILIDADE DE IDs"
+        if ! check_kaas_range_availability "$SSH_CMD" $TOTAL_VMS; then
+            print_error "Não há IDs suficientes na faixa 2000-2999 para criar o cluster."
+            exit 1
+        fi
+        
+        # Resumo
+        print_header "RESUMO DO CLUSTER"
+        echo "Cliente: $CLIENT_NAME"
+        echo "Pool: $CLIENT_POOL"
+        echo "VNet: $VNET_NAME"
+        echo "Total de VMs: $TOTAL_VMS (IDs na faixa 2000-2999)"
+        echo "Control Planes: $CP_COUNT (CPU: $CP_CPU, Mem: ${CP_MEM}MB)"
+        echo "Workers: $WORKER_COUNT (CPU: $WORKER_CPU, Mem: ${WORKER_MEM}MB)"
+        echo "Storage: $STORAGE"
+        echo ""
+        
+        read -p "Confirmar criação do cluster? (s/n): " CONFIRM
+        if [[ ! "$CONFIRM" =~ ^[Ss]$ ]]; then
+            print_warning "Operação cancelada."
+            exit 0
+        fi
+        
+        # Lista para armazenar nomes dos Control Planes
+        CP_NAMES=()
+        CP_IDS=()
+        
+        # 1. Criar HAProxy
+        print_header "CRIANDO HAProxy (Load Balancer)"
+        HAPROXY_ID=$(get_next_vmid_kaas "$SSH_CMD")
+        
+        if [ $? -ne 0 ]; then
+            print_error "Falha ao obter ID para HAProxy"
+            exit 1
+        fi
+        
+        HAPROXY_NAME="${CLIENT_NAME}-haproxy"
+        
+        create_vm_from_template "$SSH_CMD" "122" "$HAPROXY_ID" "$HAPROXY_NAME" "$STORAGE" "$VNET_NAME" "2" "2048" "auto"
+        
+        if [ $? -eq 0 ]; then
+            $SSH_CMD "pvesh set /pools/$CLIENT_POOL --vms $HAPROXY_ID"
+            save_vm_config "$CLIENT_NAME" "KaaS" "haproxy" "$HAPROXY_ID" "$HAPROXY_NAME" "$VNET_NAME"
+            print_success "HAProxy criado: ID $HAPROXY_ID (faixa 2000-2999)"
+        else
+            print_error "Falha ao criar HAProxy"
+            exit 1
+        fi
+        
+        # 2. Criar Control Planes
+        print_header "CRIANDO CONTROL PLANES"
+        for i in $(seq 1 $CP_COUNT); do
+            CP_ID=$(get_next_vmid_kaas "$SSH_CMD")
+            
+            if [ $? -ne 0 ]; then
+                print_error "Falha ao obter ID para Control Plane $i"
+                exit 1
+            fi
+            
+            CP_NAME="${CLIENT_NAME}-cp-${i}"
+            CP_NAMES+=("$CP_NAME")
+            CP_IDS+=("$CP_ID")
+            
+            print_msg "Criando Control Plane $i/$CP_COUNT (ID: $CP_ID)..."
+            
+            create_vm_from_template "$SSH_CMD" "120" "$CP_ID" "$CP_NAME" "$STORAGE" "$VNET_NAME" "$CP_CPU" "$CP_MEM" "$CP_DISK"
+            
+            if [ $? -eq 0 ]; then
+                $SSH_CMD "pvesh set /pools/$CLIENT_POOL --vms $CP_ID"
+                save_vm_config "$CLIENT_NAME" "KaaS" "control-plane" "$CP_ID" "$CP_NAME" "$VNET_NAME"
+                print_success "Control Plane $i criado: ID $CP_ID"
+            else
+                print_error "Falha ao criar Control Plane $i"
+                exit 1
+            fi
+        done
+        
+        # 3. Criar Workers
+        print_header "CRIANDO WORKERS"
+        for i in $(seq 1 $WORKER_COUNT); do
+            WORKER_ID=$(get_next_vmid_kaas "$SSH_CMD")
+            
+            if [ $? -ne 0 ]; then
+                print_error "Falha ao obter ID para Worker $i"
+                exit 1
+            fi
+            
+            WORKER_NAME="${CLIENT_NAME}-worker-${i}"
+            
+            print_msg "Criando Worker $i/$WORKER_COUNT (ID: $WORKER_ID)..."
+            
+            create_vm_from_template "$SSH_CMD" "121" "$WORKER_ID" "$WORKER_NAME" "$STORAGE" "$VNET_NAME" "$WORKER_CPU" "$WORKER_MEM" "$WORKER_DISK"
+            
+            if [ $? -eq 0 ]; then
+                $SSH_CMD "pvesh set /pools/$CLIENT_POOL --vms $WORKER_ID"
+                save_vm_config "$CLIENT_NAME" "KaaS" "worker" "$WORKER_ID" "$WORKER_NAME" "$VNET_NAME"
+                print_success "Worker $i criado: ID $WORKER_ID"
+            else
+                print_error "Falha ao criar Worker $i"
+                exit 1
+            fi
+        done
+        
+        # 4. Configurar HAProxy
+        print_header "CONFIGURANDO HAPROXY"
+        
+        # Montar string com os IPs dos Control Planes
+        # Nota: Para obter os IPs reais, seria necessário consultar o DHCP ou configurar IPs estáticos
+        # Por enquanto, usamos os nomes das VMs como referência
+        CP_SERVERS=""
+        for cp_name in "${CP_NAMES[@]}"; do
+            CP_SERVERS="${CP_SERVERS}    server ${cp_name} ${cp_name}\n"
+        done
+        
+        configure_haproxy "$SSH_CMD" "$HAPROXY_ID" "$CLIENT_NAME" "$VNET_NAME" "$CP_SERVERS"
+        
+        # 5. Resumo final
+        print_header "CLUSTER KUBERNETES CRIADO COM SUCESSO!"
+        echo "Cliente: $CLIENT_NAME"
+        echo "Pool: $CLIENT_POOL"
+        echo "VNet: $VNET_NAME"
+        echo "Faixa de IDs utilizada: 2000-2999"
+        echo ""
+        echo "Componentes do cluster:"
+        echo "  - HAProxy: ID $HAPROXY_ID ($HAPROXY_NAME)"
+        echo "  - Control Planes: $CP_COUNT"
+        for i in $(seq 0 $((CP_COUNT-1))); do
+            echo "    * ${CP_NAMES[$i]} (ID: ${CP_IDS[$i]})"
+        done
+        echo "  - Workers: $WORKER_COUNT"
+        echo ""
+        print_info "Próximos passos:"
+        echo "  1. Iniciar todas as VMs:"
+        echo "     ssh root@$PROXMOX_IP \"qm start $HAPROXY_ID\""
+        for cp_id in "${CP_IDS[@]}"; do
+            echo "     ssh root@$PROXMOX_IP \"qm start $cp_id\""
+        done
+        for i in $(seq 1 $WORKER_COUNT); do
+            echo "     ssh root@$PROXMOX_IP \"qm start ${CLIENT_NAME}-worker-${i}\" (verificar ID)"
+        done
+        echo ""
+        echo "  2. Configurar o HAProxy com o arquivo salvo em:"
+        echo "     ${LOG_DIR}/${CLIENT_NAME}/haproxy.cfg"
+        echo ""
+        echo "  3. Obter os IPs das VMs:"
+        echo "     ssh root@$PROXMOX_IP \"qm guest cmd $HAPROXY_ID network-get-interfaces\""
+        echo ""
+        echo "  4. Inicializar o cluster Kubernetes seguindo a documentação"
+        ;;
+    
+    3)
+        echo "Saindo..."
+        exit 0
+        ;;
+    
+    *)
+        print_error "Opção inválida!"
+        exit 1
+        ;;
+esac
+
+echo ""
+print_success "Processo concluído!"
+print_msg "Logs e configurações salvos em: ${LOG_DIR}/${CLIENT_NAME}/"
+

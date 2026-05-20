@@ -1,0 +1,12 @@
+# traefik-values.yaml
+service:
+  enabled: true
+  type: NodePort
+  nodePorts:
+    web:
+      port: 80
+      nodePort: 30080 # Escolha uma porta alta, por exemplo, 30080
+    websecure:
+      port: 443
+      nodePort: 30443 # Escolha uma porta alta, por exemplo, 30443
+

@@ -1,0 +1,681 @@
+===== ./requirements.yml =====
+---
+collections:
+  - name: kubernetes.core
+    version: ">=2.4.0"
+  - name: community.general
+    version: ">=6.0.0"
+
+===== ./inventory.yml =====
+all:
+  children:
+    k3s_cluster:
+      children:
+        masters:
+          hosts:
+            10.10.20.61:
+              ansible_user: elmotecnologia
+              hostname: master1
+            10.10.20.62:
+              ansible_user: elmotecnologia
+              hostname: master2
+            10.10.20.58:
+              ansible_user: elmotecnologia
+              hostname: master3
+        workers:
+          hosts:
+            10.10.20.63:
+              ansible_user: elmotecnologia
+              hostname: worker1
+            10.10.20.64:
+              ansible_user: elmotecnologia
+              hostname: worker2
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+
+===== ./playbooks/01-install-k3s-ha.yml =====
+---
+- name: Install common prerequisites on all nodes
+  hosts: all
+  gather_facts: yes
+  become: yes
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+
+    - name: Install required packages
+      package:
+        name:
+          - curl
+          - wget
+          - net-tools
+          - jq
+          - apt-transport-https
+          - ca-certificates
+        state: present
+
+    - name: Disable swap
+      command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+
+    - name: Remove swap from fstab
+      mount:
+        name: swap
+        fstype: swap
+        state: absent
+
+    - name: Load br_netfilter module
+      modprobe:
+        name: br_netfilter
+        state: present
+
+    - name: Configure sysctl
+      sysctl:
+        name: "{{ item }}"
+        value: '1'
+        state: present
+        reload: yes
+      loop:
+        - net.bridge.bridge-nf-call-iptables
+        - net.bridge.bridge-nf-call-ip6tables
+        - net.ipv4.ip_forward
+
+    - name: Set hostname
+      hostname:
+        name: "{{ hostname }}"
+      when: hostname is defined
+
+- name: Setup first master node
+  hosts: masters[0]
+  gather_facts: yes
+  become: yes
+  tasks:
+    - name: Install K3s master (first node)
+      shell: |
+        curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION=v1.27.4+k3s1 \
+        sh -s - server \
+        --cluster-init \
+        --disable servicelb \
+        --disable traefik \
+        --tls-san 10.10.20.100 \
+        --write-kubeconfig-mode 644
+
+    - name: Get node token
+      slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: node_token
+
+    - name: Save token to local file
+      copy:
+        content: "{{ node_token.content | b64decode }}"
+        dest: /tmp/k3s_token
+      delegate_to: localhost
+
+    - name: Wait for K3s to be ready
+      command: kubectl get nodes
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: result
+      until: result.rc == 0
+      retries: 30
+      delay: 10
+
+- name: Setup additional master nodes
+  hosts: masters[1:]
+  gather_facts: yes
+  become: yes
+  tasks:
+    - name: Read token from local file
+      slurp:
+        src: /tmp/k3s_token
+      register: token_content
+      delegate_to: localhost
+
+    - name: Set token fact
+      set_fact:
+        k3s_token: "{{ token_content.content | b64decode | trim }}"
+
+    - name: Install K3s master (additional nodes)
+      shell: |
+        curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION=v1.27.4+k3s1 \
+        K3S_URL=https://{{ hostvars[groups['masters'][0]]['ansible_default_ipv4']['address'] }}:6443 \
+        K3S_TOKEN={{ k3s_token }} \
+        sh -s - server \
+        --disable servicelb \
+        --disable traefik \
+        --tls-san 10.10.20.100
+
+- name: Setup worker nodes
+  hosts: workers
+  gather_facts: yes
+  become: yes
+  tasks:
+    - name: Read token from local file
+      slurp:
+        src: /tmp/k3s_token
+      register: token_content
+      delegate_to: localhost
+
+    - name: Set token fact
+      set_fact:
+        k3s_token: "{{ token_content.content | b64decode | trim }}"
+
+    - name: Install K3s worker
+      shell: |
+        curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION=v1.27.4+k3s1 \
+        K3S_URL=https://{{ hostvars[groups['masters'][0]]['ansible_default_ipv4']['address'] }}:6443 \
+        K3S_TOKEN={{ k3s_token }} \
+        sh -s - agent
+
+- name: Final verification
+  hosts: masters[0]
+  gather_facts: yes
+  become: yes
+  tasks:
+    - name: Copy kubeconfig to local
+      fetch:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: ./kubeconfig.yaml
+        flat: yes
+
+    - name: Show cluster nodes
+      command: kubectl get nodes -o wide
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      register: nodes
+      changed_when: false
+
+    - name: Display nodes
+      debug:
+        msg: "{{ nodes.stdout_lines }}"
+
+===== ./playbooks/03-validate-cluster.yml =====
+---
+- name: Validate Cluster
+  hosts: localhost
+  gather_facts: yes
+  tasks:
+    - name: Fetch kubeconfig
+      fetch:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: /tmp/kubeconfig_valid
+        flat: yes
+      delegate_to: "{{ groups['masters'][0] }}"
+
+    - name: Get nodes status
+      command: kubectl --kubeconfig /tmp/kubeconfig_valid get nodes -o wide
+      register: nodes
+      changed_when: false
+
+    - name: Display nodes
+      debug:
+        msg: "{{ nodes.stdout_lines }}"
+
+    - name: Get all pods
+      command: kubectl --kubeconfig /tmp/kubeconfig_valid get pods -A
+      register: pods
+      changed_when: false
+
+    - name: Display pods
+      debug:
+        msg: "{{ pods.stdout_lines }}"
+
+    - name: Test LoadBalancer
+      kubernetes.core.k8s:
+        kubeconfig: /tmp/kubeconfig_valid
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: test-lb
+          spec:
+            type: LoadBalancer
+            selector:
+              app: test
+            ports:
+            - port: 80
+      register: test_service
+
+    - name: Wait for LoadBalancer IP
+      command: kubectl --kubeconfig /tmp/kubeconfig_valid get svc test-lb -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+      register: lb_ip
+      until: lb_ip.stdout != ""
+      retries: 20
+      delay: 5
+
+    - name: Display LoadBalancer IP
+      debug:
+        msg: "MetalLB working! IP: {{ lb_ip.stdout }}"
+
+    - name: Clean up test service
+      command: kubectl --kubeconfig /tmp/kubeconfig_valid delete svc test-lb
+
+    - name: Remove temp kubeconfig
+      file:
+        path: /tmp/kubeconfig_valid
+        state: absent
+
+===== ./playbooks/02-network-addons.yml =====
+---
+- name: Install network addons (kube-vip + MetalLB)
+  hosts: localhost
+  gather_facts: yes
+  vars:
+    kubeconfig_path: "/root/projeto/kaas-ansible/kubeconfig.yaml"
+  tasks:
+    - name: Ensure kubeconfig exists
+      command: ssh elmotecnologia@10.10.20.60 "sudo cat /etc/rancher/k3s/k3s.yaml"
+      register: kubeconfig_content
+      changed_when: false
+
+    - name: Write kubeconfig to file
+      copy:
+        content: "{{ kubeconfig_content.stdout | regex_replace('127.0.0.1', '10.10.20.60') }}"
+        dest: "{{ kubeconfig_path }}"
+        mode: '0600'
+
+    - name: Test kubectl connection
+      command: kubectl --kubeconfig {{ kubeconfig_path }} get nodes
+      register: test_connection
+      changed_when: false
+
+    - name: Show cluster nodes
+      debug:
+        msg: "{{ test_connection.stdout_lines }}"
+
+    - name: Apply kube-vip RBAC
+      command: kubectl --kubeconfig {{ kubeconfig_path }} apply -f https://kube-vip.io/manifests/rbac.yaml
+      register: result
+      changed_when: "'created' in result.stdout or 'configured' in result.stdout"
+
+    - name: Deploy kube-vip DaemonSet
+      shell: |
+        kubectl --kubeconfig {{ kubeconfig_path }} apply -f - << 'VIPEOF'
+        apiVersion: apps/v1
+        kind: DaemonSet
+        metadata:
+          name: kube-vip-ds
+          namespace: kube-system
+        spec:
+          selector:
+            matchLabels:
+              name: kube-vip-ds
+          template:
+            metadata:
+              labels:
+                name: kube-vip-ds
+            spec:
+              hostNetwork: true
+              containers:
+              - name: kube-vip
+                image: ghcr.io/kube-vip/kube-vip:v0.6.0
+                args: ["manager"]
+                env:
+                - name: vip_arp
+                  value: "true"
+                - name: vip_interface
+                  value: "eth0"
+                - name: vip_cidr
+                  value: "32"
+                - name: vip_address
+                  value: "10.10.20.100"
+                - name: vip_leaderelection
+                  value: "true"
+                securityContext:
+                  capabilities:
+                    add: ["NET_ADMIN", "NET_RAW"]
+                imagePullPolicy: IfNotPresent
+        VIPEOF
+      register: result
+      changed_when: "'created' in result.stdout or 'configured' in result.stdout"
+
+    - name: Wait for kube-vip
+      command: kubectl --kubeconfig {{ kubeconfig_path }} get daemonset kube-vip-ds -n kube-system -o jsonpath='{.status.numberReady}'
+      register: kv
+      until: kv.stdout | int > 0
+      retries: 30
+      delay: 5
+      ignore_errors: yes
+
+    - name: Install MetalLB
+      command: kubectl --kubeconfig {{ kubeconfig_path }} apply -f https://raw.githubusercontent.com/metallb/metallb/v0.13.10/config/manifests/metallb-native.yaml
+      register: result
+      changed_when: "'created' in result.stdout or 'configured' in result.stdout"
+
+    - name: Wait for MetalLB controller
+      command: kubectl --kubeconfig {{ kubeconfig_path }} get pods -n metallb-system -l app=metallb --no-headers
+      register: metallb
+      until: metallb.stdout != ""
+      retries: 30
+      delay: 10
+
+    - name: Configure MetalLB IP pool
+      shell: |
+        kubectl --kubeconfig {{ kubeconfig_path }} apply -f - << 'METALLBEOF'
+        apiVersion: metallb.io/v1beta1
+        kind: IPAddressPool
+        metadata:
+          name: first-pool
+          namespace: metallb-system
+        spec:
+          addresses:
+          - 10.10.20.200-10.10.20.250
+        ---
+        apiVersion: metallb.io/v1beta1
+        kind: L2Advertisement
+        metadata:
+          name: example
+          namespace: metallb-system
+        spec:
+          ipAddressPools:
+          - first-pool
+        METALLBEOF
+      register: result
+      changed_when: "'created' in result.stdout or 'configured' in result.stdout"
+
+    - name: Show MetalLB status
+      command: kubectl --kubeconfig {{ kubeconfig_path }} get all -n metallb-system
+      register: metallb_status
+      changed_when: false
+
+    - name: Display status
+      debug:
+        msg: "{{ metallb_status.stdout_lines }}"
+===== ./roles/common/tasks/main.yml =====
+---
+- name: Update apt cache
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+
+- name: Install required packages
+  apt:
+    name:
+      - curl
+      - wget
+      - gnupg
+      - software-properties-common
+      - apt-transport-https
+      - ca-certificates
+      - net-tools
+      - jq
+    state: present
+
+- name: Disable swap (required for Kubernetes)
+  command: swapoff -a
+  when: ansible_swaptotal_mb > 0
+
+- name: Remove swap from fstab
+  mount:
+    name: swap
+    fstype: swap
+    state: absent
+
+- name: Load br_netfilter module
+  modprobe:
+    name: br_netfilter
+    state: present
+
+- name: Configure sysctl for Kubernetes
+  sysctl:
+    name: "{{ item }}"
+    value: '1'
+    state: present
+    reload: yes
+  loop:
+    - net.bridge.bridge-nf-call-iptables
+    - net.bridge.bridge-nf-call-ip6tables
+    - net.ipv4.ip_forward
+
+- name: Set hostname
+  hostname:
+    name: "{{ hostname }}"
+  when: hostname is defined
+
+- name: Update /etc/hosts with all cluster nodes
+  lineinfile:
+    path: /etc/hosts
+    line: "{{ item }} {{ hostvars[item]['hostname'] if hostvars[item]['hostname'] is defined else item }}"
+    state: present
+  loop: "{{ groups['all'] }}"
+  delegate_to: localhost
+  run_once: true
+
+===== ./roles/k3s-master/tasks/main.yml =====
+---
+- name: Install first master node (cluster init)
+  shell: |
+    curl -sfL https://get.k3s.io | \
+    INSTALL_K3S_VERSION={{ k3s_version }} \
+    sh -s - server \
+    --cluster-init \
+    {% for component in disable_components %}--disable {{ component }} {% endfor %} \
+    --tls-san {{ cluster_vip }} \
+    --write-kubeconfig-mode 644 \
+    --token {{ k3s_token }}
+  when: inventory_hostname == groups['masters'][0]
+
+- name: Install additional master nodes (join)
+  shell: |
+    curl -sfL https://get.k3s.io | \
+    INSTALL_K3S_VERSION={{ k3s_version }} \
+    K3S_URL=https://{{ first_master_ip }}:6443 \
+    K3S_TOKEN={{ k3s_token }} \
+    sh -s - server \
+    {% for component in disable_components %}--disable {{ component }} {% endfor %} \
+    --tls-san {{ cluster_vip }}
+  when: inventory_hostname != groups['masters'][0]
+
+- name: Wait for k3s to be ready
+  command: kubectl get nodes
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: kubectl_result
+  until: kubectl_result.rc == 0
+  retries: 30
+  delay: 10
+
+- name: Get node token (for debugging)
+  slurp:
+    src: /var/lib/rancher/k3s/server/node-token
+  register: node_token
+  when: inventory_hostname == groups['masters'][0]
+
+- name: Display token
+  debug:
+    msg: "K3s token: {{ node_token.content | b64decode }}"
+  when: inventory_hostname == groups['masters'][0]
+  run_once: true
+
+- name: Copy kubeconfig to local machine
+  fetch:
+    src: /etc/rancher/k3s/k3s.yaml
+    dest: "./kubeconfig_{{ inventory_hostname }}"
+    flat: yes
+  when: inventory_hostname == groups['masters'][0]
+
+- name: Set kubectl context
+  command: kubectl config set-cluster default --server=https://{{ cluster_vip }}:6443 --kubeconfig ./kubeconfig_{{ groups['masters'][0] }}
+  delegate_to: localhost
+  run_once: true
+
+===== ./roles/network-addons/tasks/main.yml =====
+---
+- name: Create directory for kubeconfig
+  file:
+    path: /tmp/kubeconfig
+    state: directory
+  delegate_to: localhost
+  run_once: true
+
+- name: Fetch kubeconfig from first master
+  fetch:
+    src: /etc/rancher/k3s/k3s.yaml
+    dest: /tmp/kubeconfig/config
+    flat: yes
+  delegate_to: "{{ groups['masters'][0] }}"
+  run_once: true
+
+- name: Apply kube-vip RBAC
+  kubernetes.core.k8s:
+    kubeconfig: /tmp/kubeconfig/config
+    src: https://kube-vip.io/manifests/rbac.yaml
+    state: present
+  run_once: true
+
+- name: Deploy kube-vip as DaemonSet
+  kubernetes.core.k8s:
+    kubeconfig: /tmp/kubeconfig/config
+    definition:
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: kube-vip-ds
+        namespace: kube-system
+      spec:
+        selector:
+          matchLabels:
+            name: kube-vip-ds
+        template:
+          metadata:
+            labels:
+              name: kube-vip-ds
+          spec:
+            hostNetwork: true
+            containers:
+            - name: kube-vip
+              image: ghcr.io/kube-vip/kube-vip:v0.6.0
+              args: ["manager"]
+              env:
+              - name: vip_arp
+                value: "true"
+              - name: vip_interface
+                value: "{{ network_interface }}"
+              - name: vip_cidr
+                value: "32"
+              - name: vip_address
+                value: "{{ cluster_vip }}"
+              - name: vip_leaderelection
+                value: "true"
+              securityContext:
+                capabilities:
+                  add: ["NET_ADMIN", "NET_RAW"]
+              imagePullPolicy: IfNotPresent
+    state: present
+  run_once: true
+
+- name: Install MetalLB
+  kubernetes.core.k8s:
+    kubeconfig: /tmp/kubeconfig/config
+    src: "https://raw.githubusercontent.com/metallb/metallb/{{ metallb_version }}/config/manifests/metallb-native.yaml"
+    state: present
+  run_once: true
+
+- name: Wait for MetalLB pods
+  kubernetes.core.k8s_info:
+    kubeconfig: /tmp/kubeconfig/config
+    kind: Pod
+    namespace: metallb-system
+  register: metallb_pods
+  until: metallb_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length >= 2
+  retries: 30
+  delay: 10
+  run_once: true
+
+- name: Configure MetalLB IP address pool
+  kubernetes.core.k8s:
+    kubeconfig: /tmp/kubeconfig/config
+    definition:
+      apiVersion: metallb.io/v1beta1
+      kind: IPAddressPool
+      metadata:
+        name: first-pool
+        namespace: metallb-system
+      spec:
+        addresses:
+        - "{{ metallb_ip_range }}"
+    state: present
+  run_once: true
+
+- name: Configure MetalLB L2 advertisement
+  kubernetes.core.k8s:
+    kubeconfig: /tmp/kubeconfig/config
+    definition:
+      apiVersion: metallb.io/v1beta1
+      kind: L2Advertisement
+      metadata:
+        name: example
+        namespace: metallb-system
+      spec:
+        ipAddressPools:
+        - first-pool
+    state: present
+  run_once: true
+
+- name: Clean up temp kubeconfig
+  file:
+    path: /tmp/kubeconfig
+    state: absent
+  delegate_to: localhost
+  run_once: true
+
+===== ./roles/k3s-worker/tasks/main.yml =====
+---
+- name: Install worker node
+  shell: |
+    curl -sfL https://get.k3s.io | \
+    INSTALL_K3S_VERSION={{ k3s_version }} \
+    K3S_URL=https://{{ first_master_ip }}:6443 \
+    K3S_TOKEN={{ k3s_token }} \
+    sh -s - agent
+
+- name: Wait for worker to join the cluster
+  command: kubectl get nodes {{ hostname }}
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: kubectl_result
+  until: kubectl_result.rc == 0
+  retries: 30
+  delay: 10
+  delegate_to: "{{ groups['masters'][0] }}"
+
+===== ./group_vars/all.yml =====
+# group_vars/all.yml (corrigido)
+k3s_version: v1.27.4+k3s1
+cluster_vip: 10.10.20.100
+network_interface: "{{ ansible_default_ipv4.interface }}"
+metallb_version: v0.13.10
+metallb_ip_range: 10.10.20.200-10.10.20.250
+k3s_token: "{{ lookup('file', '~/.k3s_token', errors='ignore') | default('CHANGE_ME_TOKEN', true) }}"
+disable_components:
+  - servicelb
+  - traefik
+
+# inventory.yml (corrigido para usar variável)
+all:
+  children:
+    k3s_cluster:
+      children:
+        masters:
+          hosts:
+            10.10.20.60:
+              ansible_user: elmotecnologia
+              ansible_host: 10.10.20.60
+              hostname: master1
+        workers:
+          hosts:
+            10.10.20.63:
+              ansible_user: elmotecnologia
+              ansible_host: 10.10.20.63
+              hostname: worker1
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+

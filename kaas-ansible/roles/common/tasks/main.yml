@@ -1,0 +1,59 @@
+---
+- name: Update apt cache
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+
+- name: Install required packages
+  apt:
+    name:
+      - curl
+      - wget
+      - gnupg
+      - software-properties-common
+      - apt-transport-https
+      - ca-certificates
+      - net-tools
+      - jq
+    state: present
+
+- name: Disable swap (required for Kubernetes)
+  command: swapoff -a
+  when: ansible_swaptotal_mb > 0
+
+- name: Remove swap from fstab
+  mount:
+    name: swap
+    fstype: swap
+    state: absent
+
+- name: Load br_netfilter module
+  modprobe:
+    name: br_netfilter
+    state: present
+
+- name: Configure sysctl for Kubernetes
+  sysctl:
+    name: "{{ item }}"
+    value: '1'
+    state: present
+    reload: yes
+  loop:
+    - net.bridge.bridge-nf-call-iptables
+    - net.bridge.bridge-nf-call-ip6tables
+    - net.ipv4.ip_forward
+
+- name: Set hostname
+  hostname:
+    name: "{{ hostname }}"
+  when: hostname is defined
+
+- name: Update /etc/hosts with all cluster nodes
+  lineinfile:
+    path: /etc/hosts
+    line: "{{ item }} {{ hostvars[item]['hostname'] if hostvars[item]['hostname'] is defined else item }}"
+    state: present
+  loop: "{{ groups['all'] }}"
+  delegate_to: localhost
+  run_once: true
+

@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-vip
+  namespace: kube-system
+  labels:
+    app: kube-vip
+spec:
+  serviceAccountName: kube-vip
+  hostNetwork: true
+  volumes:
+  - name: kubeconfig
+    hostPath:
+      path: /etc/rancher/k3s/k3s.yaml
+      type: File
+  containers:
+  - name: kube-vip
+    image: ghcr.io/kube-vip/kube-vip:v0.6.4
+    imagePullPolicy: IfNotPresent
+    args:
+    - manager
+    env:
+    - name: vip_arp
+      value: "true"
+    - name: vip_interface
+      value: "eth0"
+    - name: vip_cidr
+      value: "32"
+    - name: vip_address
+      value: "10.10.20.100"
+    - name: vip_leaderelection
+      value: "true"
+    - name: cp_enable
+      value: "true"
+    - name: cp_namespace
+      value: kube-system
+    - name: svc_enable
+      value: "false"
+    - name: KUBECONFIG
+      value: /etc/rancher/k3s/k3s.yaml
+    volumeMounts:
+    - name: kubeconfig
+      mountPath: /etc/rancher/k3s/k3s.yaml
+      readOnly: true
+    securityContext:
+      capabilities:
+        add:
+        - NET_ADMIN
+        - NET_RAW
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+

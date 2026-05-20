@@ -1,0 +1,119 @@
+---
+- name: Create directory for kubeconfig
+  file:
+    path: /tmp/kubeconfig
+    state: directory
+  delegate_to: localhost
+  run_once: true
+
+- name: Fetch kubeconfig from first master
+  fetch:
+    src: /etc/rancher/k3s/k3s.yaml
+    dest: /tmp/kubeconfig/config
+    flat: yes
+  delegate_to: "{{ groups['masters'][0] }}"
+  run_once: true
+
+- name: Apply kube-vip RBAC
+  kubernetes.core.k8s:
+    kubeconfig: /tmp/kubeconfig/config
+    src: https://kube-vip.io/manifests/rbac.yaml
+    state: present
+  run_once: true
+
+- name: Deploy kube-vip as DaemonSet
+  kubernetes.core.k8s:
+    kubeconfig: /tmp/kubeconfig/config
+    definition:
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: kube-vip-ds
+        namespace: kube-system
+      spec:
+        selector:
+          matchLabels:
+            name: kube-vip-ds
+        template:
+          metadata:
+            labels:
+              name: kube-vip-ds
+          spec:
+            hostNetwork: true
+            containers:
+            - name: kube-vip
+              image: ghcr.io/kube-vip/kube-vip:v0.6.0
+              args: ["manager"]
+              env:
+              - name: vip_arp
+                value: "true"
+              - name: vip_interface
+                value: "{{ network_interface }}"
+              - name: vip_cidr
+                value: "32"
+              - name: vip_address
+                value: "{{ cluster_vip }}"
+              - name: vip_leaderelection
+                value: "true"
+              securityContext:
+                capabilities:
+                  add: ["NET_ADMIN", "NET_RAW"]
+              imagePullPolicy: IfNotPresent
+    state: present
+  run_once: true
+
+- name: Install MetalLB
+  kubernetes.core.k8s:
+    kubeconfig: /tmp/kubeconfig/config
+    src: "https://raw.githubusercontent.com/metallb/metallb/{{ metallb_version }}/config/manifests/metallb-native.yaml"
+    state: present
+  run_once: true
+
+- name: Wait for MetalLB pods
+  kubernetes.core.k8s_info:
+    kubeconfig: /tmp/kubeconfig/config
+    kind: Pod
+    namespace: metallb-system
+  register: metallb_pods
+  until: metallb_pods.resources | selectattr('status.phase', 'equalto', 'Running') | list | length >= 2
+  retries: 30
+  delay: 10
+  run_once: true
+
+- name: Configure MetalLB IP address pool
+  kubernetes.core.k8s:
+    kubeconfig: /tmp/kubeconfig/config
+    definition:
+      apiVersion: metallb.io/v1beta1
+      kind: IPAddressPool
+      metadata:
+        name: first-pool
+        namespace: metallb-system
+      spec:
+        addresses:
+        - "{{ metallb_ip_range }}"
+    state: present
+  run_once: true
+
+- name: Configure MetalLB L2 advertisement
+  kubernetes.core.k8s:
+    kubeconfig: /tmp/kubeconfig/config
+    definition:
+      apiVersion: metallb.io/v1beta1
+      kind: L2Advertisement
+      metadata:
+        name: example
+        namespace: metallb-system
+      spec:
+        ipAddressPools:
+        - first-pool
+    state: present
+  run_once: true
+
+- name: Clean up temp kubeconfig
+  file:
+    path: /tmp/kubeconfig
+    state: absent
+  delegate_to: localhost
+  run_once: true
+

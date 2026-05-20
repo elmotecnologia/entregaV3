@@ -1,0 +1,3 @@
+#ansible-playbook playbooks/01-install-k3s-ha.yml -i inventory.yml -vv
+# ssh -i ~/.ssh/id_rsa elmotecnologia@10.10.50.60
+ansible-playbook -i inventory.yml playbooks/01-install-k3s-ha.yml -v

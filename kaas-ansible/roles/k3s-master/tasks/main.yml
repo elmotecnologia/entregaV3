@@ -1,0 +1,57 @@
+---
+- name: Install first master node (cluster init)
+  shell: |
+    curl -sfL https://get.k3s.io | \
+    INSTALL_K3S_VERSION={{ k3s_version }} \
+    sh -s - server \
+    --cluster-init \
+    {% for component in disable_components %}--disable {{ component }} {% endfor %} \
+    --tls-san {{ cluster_vip }} \
+    --write-kubeconfig-mode 644 \
+    --token {{ k3s_token }}
+  when: inventory_hostname == groups['masters'][0]
+
+- name: Install additional master nodes (join)
+  shell: |
+    curl -sfL https://get.k3s.io | \
+    INSTALL_K3S_VERSION={{ k3s_version }} \
+    K3S_URL=https://{{ first_master_ip }}:6443 \
+    K3S_TOKEN={{ k3s_token }} \
+    sh -s - server \
+    {% for component in disable_components %}--disable {{ component }} {% endfor %} \
+    --tls-san {{ cluster_vip }}
+  when: inventory_hostname != groups['masters'][0]
+
+- name: Wait for k3s to be ready
+  command: kubectl get nodes
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: kubectl_result
+  until: kubectl_result.rc == 0
+  retries: 30
+  delay: 10
+
+- name: Get node token (for debugging)
+  slurp:
+    src: /var/lib/rancher/k3s/server/node-token
+  register: node_token
+  when: inventory_hostname == groups['masters'][0]
+
+- name: Display token
+  debug:
+    msg: "K3s token: {{ node_token.content | b64decode }}"
+  when: inventory_hostname == groups['masters'][0]
+  run_once: true
+
+- name: Copy kubeconfig to local machine
+  fetch:
+    src: /etc/rancher/k3s/k3s.yaml
+    dest: "./kubeconfig_{{ inventory_hostname }}"
+    flat: yes
+  when: inventory_hostname == groups['masters'][0]
+
+- name: Set kubectl context
+  command: kubectl config set-cluster default --server=https://{{ cluster_vip }}:6443 --kubeconfig ./kubeconfig_{{ groups['masters'][0] }}
+  delegate_to: localhost
+  run_once: true
+

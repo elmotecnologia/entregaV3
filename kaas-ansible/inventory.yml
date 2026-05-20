@@ -1,0 +1,28 @@
+all:
+  children:
+    k3s_cluster:
+      children:
+        masters:
+          hosts:
+            "10.10.50.30":
+              ansible_user: elmotecnologia
+              hostname: master1
+            "10.10.50.31":
+              ansible_user: elmotecnologia
+              hostname: master2
+            "10.10.50.32":
+              ansible_user: elmotecnologia
+              hostname: master3
+        workers:
+          hosts:
+            "10.10.50.33":
+              ansible_user: elmotecnologia
+              hostname: worker1
+            "10.10.50.34":
+              ansible_user: elmotecnologia
+              hostname: worker2
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+    haproxy_ip: "10.10.50.61"   # apenas para referência, não mais usado no K3S_URL
+

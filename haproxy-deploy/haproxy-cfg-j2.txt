@@ -1,0 +1,34 @@
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    daemon
+
+defaults
+    log global
+    mode tcp
+    option tcplog
+    timeout connect 5s
+    timeout client 50s
+    timeout server 50s
+
+frontend kubernetes-api
+    bind *:6443
+    mode tcp
+    default_backend kubernetes-apiservers
+
+backend kubernetes-apiservers
+    mode tcp
+    balance roundrobin
+    # Sem httpchk – usa TCP check apenas
+    {% for cp in control_planes %}
+    server cp{{ loop.index }} {{ cp.ip }}:6443 check fall 3 rise 2
+    {% endfor %}
+
+frontend stats
+    bind *:8404
+    mode http
+    stats enable
+    stats uri /haproxy?stats
+    stats refresh 10s
+    stats auth {{ haproxy_stats_user }}:{{ haproxy_stats_pass }}
+

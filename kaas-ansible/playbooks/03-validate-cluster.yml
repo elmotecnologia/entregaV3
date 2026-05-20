@@ -1,0 +1,65 @@
+---
+- name: Validate Cluster
+  hosts: localhost
+  gather_facts: yes
+  tasks:
+    - name: Fetch kubeconfig
+      fetch:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: /tmp/kubeconfig_valid
+        flat: yes
+      delegate_to: "{{ groups['masters'][0] }}"
+
+    - name: Get nodes status
+      command: kubectl --kubeconfig /tmp/kubeconfig_valid get nodes -o wide
+      register: nodes
+      changed_when: false
+
+    - name: Display nodes
+      debug:
+        msg: "{{ nodes.stdout_lines }}"
+
+    - name: Get all pods
+      command: kubectl --kubeconfig /tmp/kubeconfig_valid get pods -A
+      register: pods
+      changed_when: false
+
+    - name: Display pods
+      debug:
+        msg: "{{ pods.stdout_lines }}"
+
+    - name: Test LoadBalancer
+      kubernetes.core.k8s:
+        kubeconfig: /tmp/kubeconfig_valid
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: test-lb
+          spec:
+            type: LoadBalancer
+            selector:
+              app: test
+            ports:
+            - port: 80
+      register: test_service
+
+    - name: Wait for LoadBalancer IP
+      command: kubectl --kubeconfig /tmp/kubeconfig_valid get svc test-lb -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+      register: lb_ip
+      until: lb_ip.stdout != ""
+      retries: 20
+      delay: 5
+
+    - name: Display LoadBalancer IP
+      debug:
+        msg: "MetalLB working! IP: {{ lb_ip.stdout }}"
+
+    - name: Clean up test service
+      command: kubectl --kubeconfig /tmp/kubeconfig_valid delete svc test-lb
+
+    - name: Remove temp kubeconfig
+      file:
+        path: /tmp/kubeconfig_valid
+        state: absent
+

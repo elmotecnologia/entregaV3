@@ -1,0 +1,19 @@
+---
+- name: Install worker node
+  shell: |
+    curl -sfL https://get.k3s.io | \
+    INSTALL_K3S_VERSION={{ k3s_version }} \
+    K3S_URL=https://{{ first_master_ip }}:6443 \
+    K3S_TOKEN={{ k3s_token }} \
+    sh -s - agent
+
+- name: Wait for worker to join the cluster
+  command: kubectl get nodes {{ hostname }}
+  environment:
+    KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+  register: kubectl_result
+  until: kubectl_result.rc == 0
+  retries: 30
+  delay: 10
+  delegate_to: "{{ groups['masters'][0] }}"
+

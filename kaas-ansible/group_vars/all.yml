@@ -1,0 +1,32 @@
+# group_vars/all.yml (corrigido)
+k3s_version: v1.27.4+k3s1
+cluster_vip: 10.10.20.100
+network_interface: "{{ ansible_default_ipv4.interface }}"
+metallb_version: v0.13.10
+metallb_ip_range: 10.10.20.200-10.10.20.250
+k3s_token: "{{ lookup('file', '~/.k3s_token', errors='ignore') | default('CHANGE_ME_TOKEN', true) }}"
+disable_components:
+  - servicelb
+  - traefik
+
+# inventory.yml (corrigido para usar variável)
+all:
+  children:
+    k3s_cluster:
+      children:
+        masters:
+          hosts:
+            10.10.20.60:
+              ansible_user: elmotecnologia
+              ansible_host: 10.10.20.60
+              hostname: master1
+        workers:
+          hosts:
+            10.10.20.63:
+              ansible_user: elmotecnologia
+              ansible_host: 10.10.20.63
+              hostname: worker1
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+
